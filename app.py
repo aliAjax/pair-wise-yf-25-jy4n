@@ -1,16 +1,18 @@
-"""学术会议同行评审系统：标准库 + SQLite 的可运行示例。"""
+"""学术会议同行评审系统：核心领域与数据入口（标准库 + SQLite）。
+
+业务文件划分：
+- invitations.py：邀请状态机（邀请/接受/拒绝/撤回、负载统计、再次受邀）。
+- backfill.py：补位规则（按意向顺序补下一位、跳过原因、补位记录、主席总览）。
+- server.py：HTTP 处理（路由、JSON、错误映射），``python app.py`` 亦可启动。
+"""
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
@@ -35,6 +37,12 @@ class ReviewStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
         self._schema_lock = threading.Lock()
+        # 延迟导入避免循环依赖：invitations/backfill 均依赖本模块的 BusinessError 等。
+        from backfill import BackfillService
+        from invitations import InvitationService
+
+        self.invitations = InvitationService(self)
+        self.backfill = BackfillService(self)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -91,12 +99,20 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
                     status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
+                        CHECK (status IN ('invited','accepted','declined','withdrawn','completed')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (paper_id, reviewer_id)
+                );
+                CREATE TABLE IF NOT EXISTS backfill_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    cause TEXT NOT NULL CHECK (cause IN ('manual','declined','withdrawn')),
+                    actor_id TEXT NOT NULL REFERENCES users(id),
+                    detail TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS rebuttals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,53 +282,32 @@ class ReviewStore:
             self._audit(conn, paper_id, reviewer_id, "bid.set", {"interest": interest, "note": note.strip()})
             return {"paper_id": paper_id, "reviewer_id": reviewer_id, "interest": interest}
 
+    # ---- 邀请与补位：状态机在 invitations.py，补位规则在 backfill.py ----
+
     def assign(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
-        with self.connect() as conn:
-            chair = self._user(conn, chair_id)
-            self._require(chair, "chair")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
-                reviewer = self._user(conn, reviewer_id)
-                self._require(reviewer, "reviewer")
-                if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
-                    raise BusinessError("评审人与论文存在利益冲突", 409, "conflict_of_interest")
-                load = conn.execute(
-                    "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
-                    (reviewer_id,),
-                ).fetchone()[0]
-                if load >= reviewer["load_limit"]:
-                    raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
-                try:
-                    cur = conn.execute(
-                        "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
-                        (paper_id, reviewer_id, utcnow(), utcnow()),
-                    )
-                except sqlite3.IntegrityError:
-                    raise BusinessError("该评审人已被分配此论文", 409, "assignment_exists")
-                conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
-                assignment_id = cur.lastrowid
-                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id})
-                return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "invited"}
-            except Exception:
-                conn.rollback()
-                raise
+        """主席手动邀请（或再次邀请）评审人。"""
+        return self.invitations.invite(chair_id, paper_id, reviewer_id)
 
     def respond_assignment(self, reviewer_id: str, assignment_id: int, accepted: bool) -> dict:
-        with self.connect() as conn:
-            reviewer = self._user(conn, reviewer_id)
-            self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "invited":
-                raise BusinessError("邀请已经处理", 409, "invitation_already_answered")
-            status = "accepted" if accepted else "declined"
-            conn.execute("UPDATE assignments SET status=?,updated_at=? WHERE id=?", (status, utcnow(), assignment_id))
-            self._audit(conn, row["paper_id"], reviewer_id, "assignment.respond", {"assignment_id": assignment_id, "status": status})
-            return {"id": assignment_id, "status": status}
+        """接受或拒绝邀请；拒绝后自动按意向顺序补下一位。"""
+        result = self.invitations.respond(reviewer_id, assignment_id, accepted)
+        if not accepted:
+            result["backfill"] = self.backfill.run(reviewer_id, result["paper_id"], "declined")
+        return result
+
+    def withdraw_assignment(self, reviewer_id: str, assignment_id: int) -> dict:
+        """撤回已接受的邀请；释放负载并自动补位。"""
+        result = self.invitations.withdraw(reviewer_id, assignment_id)
+        result["backfill"] = self.backfill.run(reviewer_id, result["paper_id"], "withdrawn")
+        return result
+
+    def run_backfill(self, chair_id: str, paper_id: int) -> dict:
+        """主席手动触发：从愿意评审的人里按意向顺序补齐有效邀请。"""
+        return self.backfill.run(chair_id, paper_id, "manual")
+
+    def invitation_overview(self, chair_id: str, paper_id: int) -> dict:
+        """主席页面：邀请状态、候选人可邀性及原因、历次补位结果。"""
+        return self.backfill.chair_view(chair_id, paper_id)
 
     def submit_review(self, reviewer_id: str, assignment_id: int, score: int, text: str) -> dict:
         if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
@@ -388,144 +383,7 @@ class ReviewStore:
             return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
 
 
-class ReviewHandler(BaseHTTPRequestHandler):
-    server_version = "AcademicReview/1.0"
-
-    def _store(self) -> ReviewStore:
-        return self.server.store  # type: ignore[attr-defined]
-
-    def _send(self, status: int, payload) -> None:
-        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length == 0:
-            return {}
-        try:
-            return json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise BusinessError("请求体必须是合法 JSON", 400, "invalid_json")
-
-    def _user_id(self) -> str:
-        return self.headers.get("X-User-Id", "")
-
-    def _dispatch(self, method: str) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        if method == "GET" and path == "/":
-            html = (BASE_DIR / "web" / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers()
-            self.wfile.write(html)
-            return
-        if method == "GET" and path == "/health":
-            return self._send(200, {"ok": True})
-        store = self._store()
-        parts = [p for p in path.split("/") if p]
-        if not parts or parts[0] != "api":
-            raise BusinessError("接口不存在", 404, "not_found")
-        if parts == ["api", "papers"] and method == "GET":
-            return self._send(200, {"items": store.list_papers(self._user_id())})
-        if parts == ["api", "papers"] and method == "POST":
-            data = self._body()
-            return self._send(201, store.submit_paper(self._user_id(), data.get("title", ""), data.get("abstract", "")))
-        if len(parts) >= 3 and parts[:2] == ["api", "papers"]:
-            paper_id = int(parts[2])
-            if len(parts) == 3 and method == "GET":
-                return self._send(200, store.get_paper(self._user_id(), paper_id))
-            if len(parts) == 4 and parts[3] == "bids" and method == "POST":
-                data = self._body()
-                return self._send(201, store.bid(self._user_id(), paper_id, data.get("interest", ""), data.get("note", "")))
-            if len(parts) == 4 and parts[3] == "conflicts" and method == "POST":
-                data = self._body()
-                return self._send(201, store.add_conflict(self._user_id(), paper_id, data.get("reviewer_id", ""), data.get("reason", "")))
-            if len(parts) == 4 and parts[3] == "assignments" and method == "POST":
-                data = self._body()
-                return self._send(201, store.assign(self._user_id(), paper_id, data.get("reviewer_id", "")))
-            if len(parts) == 4 and parts[3] == "rebuttal" and method == "POST":
-                data = self._body()
-                return self._send(201, store.submit_rebuttal(self._user_id(), paper_id, data.get("content", "")))
-            if len(parts) == 4 and parts[3] == "decision" and method == "POST":
-                data = self._body()
-                return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
-            if len(parts) == 4 and parts[3] == "history" and method == "GET":
-                return self._send(200, {"items": store.history(self._user_id(), paper_id)})
-        if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
-            assignment_id = int(parts[2])
-            data = self._body()
-            if parts[3] == "respond":
-                return self._send(200, store.respond_assignment(self._user_id(), assignment_id, bool(data.get("accepted"))))
-            if parts[3] == "review":
-                return self._send(201, store.submit_review(self._user_id(), assignment_id, data.get("score"), data.get("text", "")))
-        raise BusinessError("接口不存在", 404, "not_found")
-
-    def do_GET(self):
-        self._handle("GET")
-
-    def do_POST(self):
-        self._handle("POST")
-
-    def do_DELETE(self):
-        self._handle("DELETE")
-
-    def _handle(self, method: str) -> None:
-        try:
-            self._dispatch(method)
-        except BusinessError as exc:
-            self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
-        except ValueError:
-            self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
-        except Exception as exc:
-            self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
-
-    def log_message(self, fmt, *args):
-        print(f"{self.address_string()} - {fmt % args}")
-
-
-class ReviewServer(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(self, address, store: ReviewStore):
-        self.store = store
-        super().__init__(address, ReviewHandler)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="学术会议同行评审系统")
-    parser.add_argument("--db", default=str(DEFAULT_DB))
-    parser.add_argument("--port", type=int, default=8101)
-    parser.add_argument("--init", action="store_true", help="初始化数据库")
-    parser.add_argument("--seed", action="store_true", help="写入演示用户")
-    parser.add_argument("--no-init", action="store_true", help="启动时不自动初始化")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    store = ReviewStore(args.db)
-    if args.init or args.seed or not args.no_init:
-        store.init_schema()
-    if args.seed:
-        store.seed()
-    if args.init or args.seed:
-        print(f"数据库已初始化: {args.db}")
-        return
-    server = ReviewServer(("127.0.0.1", args.port), store)
-    print(f"评审系统运行于 http://127.0.0.1:{args.port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-
-
 if __name__ == "__main__":
+    from server import main
+
     main()

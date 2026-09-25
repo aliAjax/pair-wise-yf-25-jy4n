@@ -1,13 +1,27 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学术会议同行评审</title>
-<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
+<style>body{font:16px system-ui;max-width:960px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px;max-height:320px;overflow:auto}</style></head>
 <body><h1>学术会议同行评审</h1><p>选择身份后，页面会通过 <code>X-User-Id</code> 调用 JSON API。演示账号：alice、bob、r1、r2、r3、chair。</p>
 <div class="grid"><section class="panel"><h2>提交论文</h2><select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select><input id="title" placeholder="标题"><textarea id="abstract" placeholder="摘要（至少20字）"></textarea><button onclick="submitPaper()">提交</button></section>
-<section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section></div>
+<section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section>
+<section class="panel"><h2>主席：邀请与补位</h2>
+<input id="pid" type="number" placeholder="论文ID" style="width:90px"><input id="rid" placeholder="评审人ID（手动邀请）">
+<button onclick="manualInvite()">邀请指定评审人</button><button onclick="runBackfill()">按意向顺序补位</button><button onclick="loadInvitations()">查看邀请与补位记录</button>
+<pre id="inv"></pre></section>
+<section class="panel"><h2>评审人：处理邀请</h2>
+<input id="aid" type="number" placeholder="邀请ID" style="width:90px">
+<button onclick="respond(true)">接受</button><button onclick="respond(false)">拒绝</button><button onclick="withdraw()">撤回已接受</button>
+<pre id="resp"></pre><p>拒绝或撤回后，系统会自动按意向顺序补下一位，结果与原因见主席面板。</p></section></div>
 <script>
 const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
 document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
 async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
-async function submitPaper(){const p=await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})});alert(JSON.stringify(p,null,2))}
-async function loadPapers(){papers.textContent=JSON.stringify(await api("/api/papers"),null,2)}
+const show=el=>data=>{el.textContent=JSON.stringify(data,null,2)};
+async function submitPaper(){show(papers)(await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})}))}
+async function loadPapers(){show(papers)(await api("/api/papers"))}
+async function manualInvite(){show(inv)(await api(`/api/papers/${pid.value}/assignments`,{method:"POST",body:JSON.stringify({reviewer_id:rid.value})}))}
+async function runBackfill(){show(inv)(await api(`/api/papers/${pid.value}/backfill`,{method:"POST"}))}
+async function loadInvitations(){show(inv)(await api(`/api/papers/${pid.value}/invitations`))}
+async function respond(accepted){show(resp)(await api(`/api/assignments/${aid.value}/respond`,{method:"POST",body:JSON.stringify({accepted})}))}
+async function withdraw(){show(resp)(await api(`/api/assignments/${aid.value}/withdraw`,{method:"POST"}))}
 </script></body></html>
